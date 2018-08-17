@@ -9,11 +9,11 @@ For more detailed installation instructions visit http://muq.mit.edu/master-docs
 Installation: 
     1. Create a folder to install MUQ2 in 
     2. In termianl go to directory where you want to download to then
-        git clone https://bitbucket.org/mituq/muq2.git
-        cd muq2
-        cmake -DCMAKE_INSTALL_PREFIX=/my/install/path -DMUQ_USE_PYTHON=ON 
-        make -j4
-        make install
+         git clone https://bitbucket.org/mituq/muq2.git
+         cd muq2
+         cmake -DCMAKE_INSTALL_PREFIX=/my/install/path -DMUQ_USE_PYTHON=ON 
+         make -j4
+         make install
 
      -j4 is an option specifying that make can use 4 threads for parallel compilation.
      Depending on what versions of python you have it may be nessecary to add 
