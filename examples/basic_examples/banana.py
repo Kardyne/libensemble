@@ -1,7 +1,7 @@
-########################################################################
-# MUQ2 is required to run  https://bitbucket.org/mituq/muq2
+#############################################################################################
+# MUQ2 (MIT Uncertainty Quantification) is required to run  https://bitbucket.org/mituq/muq2
 # Pandas is optional for plotting
-########################################################################
+#############################################################################################
 # """
 # Runs MUQ2 and libEnsemble in order to generate the banana distribution
 #
@@ -9,6 +9,10 @@
 #         1/a*z2+b(a*z1)^2 + b*a^2 ]
 #
 # using importance sampling, adaptive Metropolis Hastings MCMC, and adaptive importance sampling
+#
+# NOTE: The AIS is a work in progress
+#
+# NOTE: If you choose to compare you will need to close the plots to proceed
 #
 # Execute via the following command:
 #    mpiexec -np 4 python3 banana.py
@@ -61,6 +65,7 @@ zDist = mm.Gaussian(np.zeros((paramDim)))
 n = 50000
 a = 1.0
 b = 1.0
+# Samples from True distribution
 if MPI.COMM_WORLD.Get_rank() == 0:
     invf = InvBananaTrans(a,b)
     fwd = BananaTrans(a,b)
@@ -78,7 +83,7 @@ propMu = np.array([0,-4])
 propCov = np.array([ [4, 0],
                      [0, 20]])
 
-compare = False
+compare = True # True if you want to see IS and AM
 if MPI.COMM_WORLD.Get_rank() == 0 and compare==True:
     graph = mm.WorkGraph()
     graph.AddNode(invf, "Banana Transformation")
@@ -87,7 +92,7 @@ if MPI.COMM_WORLD.Get_rank() == 0 and compare==True:
     bananaDens = graph.CreateModPiece("Gaussian Reference")
 
 #####################################
-# Importance Sampling
+# Importance Sampling (IS)
 #####################################
 if MPI.COMM_WORLD.Get_rank() == 0 and compare==True:
     isProp = mm.Gaussian(propMu, propCov)
@@ -99,7 +104,7 @@ if MPI.COMM_WORLD.Get_rank() == 0 and compare==True:
         logProp = isProp.LogDensity(samp[:,i])
         w[i] = np.exp(logBanana - logProp)
 
-    thres = 1e-4
+    thres = 1e-3
     inds = np.where(w>thres)[0]
     num_small = w.shape[0]-inds.shape[0]
     H_IS = {'weight': w,
@@ -123,11 +128,19 @@ if MPI.COMM_WORLD.Get_rank() == 0 and compare==True:
     plt.colorbar(h)
     plt.title("IS Banana Dist no small")
 
+    df = pd.DataFrame(samp[:,inds].T, columns=['x', 'y'])
+    scatter_matrix(df, alpha=0.2, figsize=(6, 6), diagonal='kde')
+    plt.suptitle('IS')
+    
+    df = pd.DataFrame(y, columns=['x', 'y'])
+    scatter_matrix(df, alpha=0.2, figsize=(6, 6), diagonal='kde')
+    plt.suptitle('True')
+        
     plt.show()
 
 
 #####################################
-# Adaptive Metropolis MCMC
+# Adaptive Metropolis MCMC (AM)
 #####################################
 if MPI.COMM_WORLD.Get_rank() == 0 and compare==True:
     problem = ms.SamplingProblem(bananaDens)
@@ -187,10 +200,12 @@ if MPI.COMM_WORLD.Get_rank() == 0 and compare==True:
 
     df = pd.DataFrame(sampMat.T, columns=['x', 'y'])
     scatter_matrix(df, alpha=0.2, figsize=(6, 6), diagonal='kde')
-
+    plt.suptitle('MH')
+    
     df = pd.DataFrame(y, columns=['x', 'y'])
     scatter_matrix(df, alpha=0.2, figsize=(6, 6), diagonal='kde')
-
+    plt.suptitle('True')
+    
     plt.show()
 
     H_AM = {'weight': samps.Weights(),
@@ -235,11 +250,9 @@ num_batches = 5000
 # Tell libEnsemble when to stop 
 exit_criteria = {'sim_max': gen_specs['num_subbatches']*num_batches} #To get correct exit criteria 
 
-np.random.seed(1)
 persis_info = {}
 for i in range(MPI.COMM_WORLD.Get_size()):
     persis_info[i] = {'rand_stream': np.random.RandomState(i)}
-
 
 # Can't do a "persistent gen run" if only one worker
 if MPI.COMM_WORLD.Get_size()<=2:
@@ -297,15 +310,18 @@ if MPI.COMM_WORLD.Get_rank() == 0:
             plt.plot(corr[int(corr.size/2):]/np.max(corr), label='Dimension %d'%i)
     
         maxLagPlot = 1500
-        plt.plot([-maxLagPlot,0.0],[4.0*maxLagPlot,0.0],'--k', label='Zero')
-
+        plt.axhline(y=0, linewidth=.5, color='k')
         plt.xlim([0,maxLagPlot])
         plt.ylim([-0.1,1.1])
         plt.legend()
         
-        
         df = pd.DataFrame(H['theta'][inds,:], columns=['x', 'y'])
         scatter_matrix(df, alpha=0.2, figsize=(6, 6), diagonal='kde')
+        plt.suptitle('AIS')
+        
+        df = pd.DataFrame(y, columns=['x', 'y'])
+        scatter_matrix(df, alpha=0.2, figsize=(6, 6), diagonal='kde')
+        plt.suptitle('True')
         
         plt.show()
     #np.save('banana', H)    
