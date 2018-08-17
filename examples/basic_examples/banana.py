@@ -10,7 +10,7 @@
 #
 # using importance sampling, adaptive Metropolis Hastings MCMC, and adaptive importance sampling
 #
-# NOTE: The AIS is a work in progress
+# NOTE: The AIS is a work in progress, you may see errors involving zero divides and invalid values encountered
 #
 # NOTE: If you choose to compare you will need to close the plots to proceed
 #
