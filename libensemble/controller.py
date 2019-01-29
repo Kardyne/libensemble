@@ -17,6 +17,9 @@ import logging
 import signal
 import itertools
 import time
+import json
+import math
+from mpi4py import MPI
 from libensemble.register import Register
 from libensemble.resources import Resources
 
@@ -1097,3 +1100,237 @@ class BalsamJobController(JobController):
         No action is taken
         '''
         logger.warning("set_kill_mode currently has no action with Balsam controller")
+
+
+class CuttrJobController(JobController):
+
+    controller = None
+
+    def __init__(self, registry=None, auto_resources=True, nodelist_env_slurm=None, nodelist_env_cobalt=None):
+        if MPI.COMM_WORLD.Get_rank() == 0:
+            worker_count = MPI.COMM_WORLD.Get_size() - 1
+            slice_count = os.environ.get('SLICE_COUNT')
+            if slice_count is not None and slice_count != '':
+                slice_count = int(slice_count)
+            else:
+                slice_count = worker_count
+            total_core_count = int(subprocess.check_output('hwloc-calc all -N pu', shell=True))
+            core_count = os.environ.get('CORE_COUNT')
+            if core_count is not None and core_count != '':
+                core_count = int(core_count)
+            else:
+                core_count = total_core_count
+            
+            cat_masks = os.environ.get('CAT_MASKS').split(' ') * int(math.ceil(float(total_core_count) / float(core_count)))
+                
+            cpulists = subprocess.check_output('hwloc-distrib {} | hwloc-calc --li --po --pulist'.format(total_core_count // core_count), shell=True).strip().split('\n') * int(math.ceil(float(worker_count) / float(slice_count)))
+            cpumask = subprocess.check_output('hwloc-distrib {}'.format(total_core_count // core_count), shell=True).strip().replace('0x', '').split('\n') * int(math.ceil(float(worker_count) / float(slice_count)))
+            numanodes = subprocess.check_output('hwloc-distrib {} | hwloc-calc --li --po --pulist --intersect NUMAnode'.format(total_core_count // core_count), shell=True).strip().split('\n') * int(math.ceil(float(worker_count) / float(slice_count)))
+
+            command_list = ''
+            for rank in range(1, MPI.COMM_WORLD.Get_size()):
+                if command_list != '':
+                    command_list = command_list + ','
+                first_cpu = cpulists[rank - 1].split(",")[0]
+                cache_id = subprocess.check_output('cat /sys/devices/system/cpu/cpu{}/cache/index3/id'.format(first_cpu), shell=True).strip()
+                schemata = 'L3:{}={}'.format(cache_id, cat_masks[rank - 1])
+                command_list = (command_list +
+                    ('{{'
+                        '"command":"create",'
+                        '"name":"{}",'
+                        '"args":['
+                            '"cpuset",'
+                            '"perf_event",'
+                            '"resctrl"'
+                        '],'
+                        '"properties":{{'
+                            '"cpuset.cpus":"{}",'
+                            '"cpuset.mems":"{}",'
+                            '"cpus":"{}",'
+                            '"schemata":"{}\\n"'
+                        '}}'
+                     '}}').format(rank, cpulists[rank - 1], numanodes[rank - 1],
+                                  cpumask[rank - 1], schemata))
+            json = '{{"commands":[{}]}}'.format(command_list)
+            subprocess.check_call(['cuttr', 'transaction', json])
+        # Because of Python2
+        JobController.__init__(self, registry, auto_resources, nodelist_env_slurm, nodelist_env_cobalt)
+
+
+    def launch(self, calc_type, num_procs=None, num_nodes=None, ranks_per_node=None,
+               machinefile=None, app_args=None, stdout=None, stderr=None, stage_inout=None, hyperthreads=False, test=False):
+        ''' Creates a new job, and either launches or schedules to launch in the job controller
+
+        The created job object is returned.
+
+        Parameters
+        ----------
+
+        calc_type: String
+            The calculation type: 'sim' or 'gen'
+
+        num_procs: int, optional
+            The total number of MPI tasks on which to launch the job.
+
+        num_nodes: int, optional
+            The number of nodes on which to launch the job.
+
+        ranks_per_node: int, optional
+            The ranks per node for this job.
+            
+        machinefile: string, optional
+            Name of a machinefile for this job to use.
+
+        app_args: string, optional
+            A string of the application arguments to be added to job launch command line.
+
+        stdout: string, optional
+            A standard output filename.
+
+        stderr: string, optional
+            A standard error filename.
+
+        stage_inout: string, optional
+            A directory to copy files from. Default will take from current directory.
+
+        hyperthreads: boolean, optional
+            Whether to launch MPI tasks to hyperthreads
+
+        test: boolean, optional
+            Whether this is a test - No job will be launched. Instead runline is printed to logger (At INFO level).
+
+
+        Returns
+        -------
+
+        job: obj: Job
+            The lauched job object.
+
+
+        Note that if some combination of num_procs, num_nodes and ranks_per_node are provided, these will be honored if possible. If resource detection is on and these are omitted, then the available resources will be divided amongst workers.
+
+        '''
+
+        # Find the default sim or gen app from registry.sim_default_app OR registry.gen_default_app
+        # Could take optional app arg - if they want to supply here - instead of taking from registry
+        if calc_type == 'sim':
+            if self.registry.sim_default_app is None:
+                raise JobControllerException("Default sim app is not set")
+            app = self.registry.sim_default_app
+        elif calc_type == 'gen':
+            if self.registry.gen_default_app is None:
+                raise JobControllerException("Default gen app is not set")
+            app = self.registry.gen_default_app
+        else:
+            raise JobControllerException("Unrecognized calculation type", calc_type)
+
+
+        #-------- Up to here should be common - can go in a baseclass and make all concrete classes inherit ------#
+        hostlist = None
+        if machinefile is None and self.auto_resources:
+
+            #klugging this for now - not nec machinefile if more than one node - try a hostlist
+
+            num_procs, num_nodes, ranks_per_node = self.get_resources(num_procs=num_procs, num_nodes=num_nodes, ranks_per_node=ranks_per_node, hyperthreads=hyperthreads)
+
+            if num_nodes > 1:
+                #hostlist
+                hostlist = self.get_hostlist()
+            else:
+                #machinefile
+                if self.workerID is not None:
+                    machinefile = 'machinefile_autogen_for_worker_' + str(self.workerID)
+                else:
+                    machinefile = 'machinefile_autogen'
+                mfile_created, num_procs, num_nodes, ranks_per_node = self.create_machinefile(machinefile, num_procs, num_nodes, ranks_per_node, hyperthreads)
+                if not mfile_created:
+                    raise JobControllerException("Auto-creation of machinefile failed")
+
+        else:
+            num_procs, num_nodes, ranks_per_node = JobController.job_partition(num_procs, num_nodes, ranks_per_node, machinefile)
+
+
+        default_workdir = os.getcwd() #Will be possible to override with arg when implemented
+        job = Job(app, app_args, num_procs, num_nodes, ranks_per_node, machinefile, hostlist, default_workdir, stdout, stderr, self.workerID)
+
+        #Temporary perhaps - though when create workdirs - will probably keep output in place
+        if stage_inout is not None:
+            logger.warning('stage_inout option ignored in this job_controller - runs in-place')
+
+        #Construct run line - possibly subroutine
+        runline = []
+        use_perf = os.environ.get('USE_PERF')
+
+        if use_perf is None:
+            cmd = self.mpi_launcher
+        else:
+            cmd = 'perf'
+            use_perf = use_perf.replace('{rank}', str(MPI.COMM_WORLD.Get_rank()))
+            runline.extend(use_perf.split())
+            runline.append(self.mpi_launcher)
+
+
+        if job.machinefile is not None:
+            #os.environ['SLURM_HOSTFILE'] = job.machinefile
+            runline.append(self.mfile)
+            runline.append(job.machinefile)
+
+        #Should be else - if machine file - dont need any other config
+
+        if job.hostlist is not None:
+            #os.environ['SLURM_HOSTFILE'] = job.machinefile
+            runline.append(self.hostlist)
+            runline.append(job.hostlist)
+
+        if job.num_procs is not None:
+            runline.append(self.nprocs)
+            runline.append(str(job.num_procs))
+
+        #Not currently setting nodes
+        #- as not always supported - but should always have the other two after calling _job_partition
+        #if job.num_nodes is not None:
+            #runline.append(self.nnodes)
+            #runline.append(str(job.num_nodes))
+
+        #Currently issues - command depends on mpich/openmpi etc...
+        if job.ranks_per_node is not None:
+            runline.append(self.ppn)
+            runline.append(str(job.ranks_per_node))
+
+        runline.append(job.app.full_path)
+
+        if job.app_args is not None:
+            runline.extend(job.app_args.split())
+ 
+        runline = ['cuttr', 'transaction',
+            ('{{"commands":[{{'
+                '"command":"fork_exec",'
+                '"name":"{}",'
+                '"cmd":"{}",'
+                '"cmd_args":{}'
+            '}}]}}').format(MPI.COMM_WORLD.Get_rank(), cmd, json.dumps(runline))
+        ]
+
+
+
+        if test:
+            logger.info('Test selected: Not launching job')
+            logger.info('runline args are {}'.format(runline))
+        else:
+            logger.debug("Launching job {}: {}".format(job.name, " ".join(runline))) #One line
+            #logger.debug("Launching job {}:\n{}{}".format(job.name, " "*32, " ".join(runline))) #With newline
+
+            #not good for timing job itself as dont know when finishes - if use this prob. change to date time or
+            #use for timeout. For now using for timing with approx end....
+            job.launch_time = time.time()
+
+            #job.process = subprocess.Popen(runline, cwd='./', stdout=open(job.stdout, 'w'), stderr=open(job.stderr, 'w'), shell=False)
+            job.process = subprocess.Popen(runline, cwd='./', stdout=open(job.stdout, 'w'), stderr=open(job.stderr, 'w'), shell=False, preexec_fn=os.setsid)
+
+            #To test when have workdir
+            #job.process = subprocess.Popen(runline, cwd=job.workdir, stdout=open(job.stdout, 'w'), stderr=open(job.stderr, 'w'), shell=False, preexec_fn=os.setsid)
+
+            self.list_of_jobs.append(job)
+
+        #return job.id
+        return job
